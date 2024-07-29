@@ -57,7 +57,6 @@ static struct modbus_serial_config modbus_serial_cfg[] = {
 		.mode = MODBUS_MODE_RAW,			\
 	}
 
-
 static struct modbus_context mb_ctx_tbl[] = {
 	DT_INST_FOREACH_STATUS_OKAY(MODBUS_DT_GET_DEV)
 #ifdef CONFIG_MODBUS_RAW_ADU
@@ -65,11 +64,34 @@ static struct modbus_context mb_ctx_tbl[] = {
 #endif
 };
 
+/* liteon start */
+static void modbus_trans_timeout(struct k_timer *timer)
+{
+	struct modbus_context *ctx = k_timer_user_data_get(timer);
+
+	ctx->trans_status = MODBUS_TRANS_TIMEOUT;
+	ctx->trans_result = -ETIMEDOUT;
+	LOG_DBG("Submit transparent timeout work");
+	k_work_submit(&ctx->server_work);
+}
+/* liteon end */
+
 static void modbus_rx_handler(struct k_work *item)
 {
 	struct modbus_context *ctx;
 
 	ctx = CONTAINER_OF(item, struct modbus_context, server_work);
+
+	/* liteon start */
+	if (ctx->trans_status == MODBUS_TRANS_WAIT_NOTIFY) {
+		LOG_ERR("Another transparent operation is pending");
+		return;
+	}
+
+	if (ctx->trans_status == MODBUS_TRANS_DONE) {
+		goto trans_resume;
+	}
+	/* liteon end */
 
 	switch (ctx->mode) {
 	case MODBUS_MODE_RTU:
@@ -89,10 +111,30 @@ static void modbus_rx_handler(struct k_work *item)
 		return;
 	}
 
+trans_resume:
+
 	if (ctx->client == true) {
 		k_sem_give(&ctx->client_wait_sem);
+
 	} else if (IS_ENABLED(CONFIG_MODBUS_SERVER)) {
-		bool respond = modbus_server_handler(ctx);
+
+		bool respond;
+		/* liteon start */
+		if (!ctx->pmm_server) {
+			respond = modbus_server_handler(ctx);
+		} else {
+			respond = modbus_server_handler_pmm(ctx);
+		}
+
+		/* inturrupt point for waiting transparent operation */
+		if (ctx->trans_status == MODBUS_TRANS_WAIT_NOTIFY) {
+			LOG_DBG("Interrupt modbus_rx_handler for waiting transparent operation finished");
+			k_timer_user_data_set(&ctx->trans_timeout_timer, ctx);
+			k_timer_start(&ctx->trans_timeout_timer, ctx->trans_timeout, K_NO_WAIT);
+
+			return;
+		}
+		/* liteon end */
 
 		if (respond) {
 			modbus_tx_adu(ctx);
@@ -111,6 +153,10 @@ static void modbus_rx_handler(struct k_work *item)
 		default:
 			break;
 		}
+
+		/* litone start */
+		ctx->trans_status = MODBUS_TRANS_NONE;
+		/* litone end */
 	}
 }
 
@@ -243,6 +289,12 @@ int modbus_init_server(const int iface, struct modbus_iface_param param)
 	}
 
 	ctx->client = false;
+	/* liteon start */
+	ctx->pmm_server = false;
+	ctx->trans_status = MODBUS_TRANS_NONE;
+	ctx->trans_result = 0;
+	ctx->trans_timeout = K_NO_WAIT;
+	/* liteon end */
 
 	if (modbus_user_fc_init(ctx, param) != 0) {
 		LOG_ERR("Failed to init MODBUS user defined function codes");
@@ -275,7 +327,82 @@ int modbus_init_server(const int iface, struct modbus_iface_param param)
 	}
 
 	ctx->unit_id = param.server.unit_id;
+	sys_slist_init(&ctx->pmm_ids);
 	ctx->mbs_user_cb = param.server.user_cb;
+	if (IS_ENABLED(CONFIG_MODBUS_FC08_DIAGNOSTIC)) {
+		modbus_reset_stats(ctx);
+	}
+
+	LOG_DBG("Modbus interface %s initialized", ctx->iface_name);
+
+	return 0;
+
+init_server_error:
+	if (ctx != NULL) {
+		atomic_clear_bit(&ctx->state, MODBUS_STATE_CONFIGURED);
+	}
+
+	return rc;
+}
+
+int modbus_init_server_pmm(const int iface, struct modbus_iface_param param)
+{
+	struct modbus_context *ctx = NULL;
+	int rc = 0;
+
+	if (!IS_ENABLED(CONFIG_MODBUS_SERVER)) {
+		LOG_ERR("Modbus server support is not enabled");
+		rc = -ENOTSUP;
+		goto init_server_error;
+	}
+
+	if (param.server.user_cb == NULL) {
+		LOG_ERR("User callbacks should be available");
+		rc = -EINVAL;
+		goto init_server_error;
+	}
+
+	ctx = modbus_init_iface(iface);
+	if (ctx == NULL) {
+		rc = -EINVAL;
+		goto init_server_error;
+	}
+
+	ctx->client = false;
+	/* liteon start */
+	ctx->pmm_server = true;
+	ctx->trans_status = MODBUS_TRANS_NONE;
+	ctx->trans_result = 0;
+	k_timer_init(&ctx->trans_timeout_timer, modbus_trans_timeout, NULL);
+	/* liteon end */
+
+	if (modbus_user_fc_init(ctx, param) != 0) {
+		LOG_ERR("Failed to init MODBUS user defined function codes");
+		rc = -EINVAL;
+		goto init_server_error;
+	}
+
+	switch (param.mode) {
+	case MODBUS_MODE_RTU:
+		if (IS_ENABLED(CONFIG_MODBUS_SERIAL) &&
+		    modbus_serial_init(ctx, param) != 0) {
+			LOG_ERR("Failed to init MODBUS over serial line");
+			rc = -EINVAL;
+			goto init_server_error;
+		}
+		break;
+	default:
+		LOG_ERR("Only support dynamic id function under RTU MODBUS mode");
+		rc = -ENOTSUP;
+		goto init_server_error;
+	}
+
+	ctx->unit_id = 0;
+	/* liteon start */
+	sys_slist_init(&ctx->pmm_ids);
+	ctx->mbs_pmm_user_cb = param.pmm_server.pmm_user_cb;
+	ctx->trans_timeout = K_USEC(param.pmm_server.trans_timeout);
+	/* liteon end */
 	if (IS_ENABLED(CONFIG_MODBUS_FC08_DIAGNOSTIC)) {
 		modbus_reset_stats(ctx);
 	}
@@ -332,6 +459,12 @@ int modbus_init_client(const int iface, struct modbus_iface_param param)
 	}
 
 	ctx->client = true;
+	/* liteon start */
+	ctx->pmm_server = false;
+	ctx->trans_status = MODBUS_TRANS_NONE;
+	ctx->trans_result = 0;
+	ctx->trans_timeout = K_NO_WAIT;
+	/* liteon end */
 
 	switch (param.mode) {
 	case MODBUS_MODE_RTU:
@@ -399,9 +532,179 @@ int modbus_disable(const uint8_t iface)
 	ctx->rxwait_to = 0;
 	ctx->unit_id = 0;
 	ctx->mbs_user_cb = NULL;
+	/* liteon start */
+	if (ctx->pmm_server) {
+		ctx->trans_status = MODBUS_TRANS_NONE;
+		ctx->trans_result = 0;
+		_modbus_unregister_all_pmm_id(ctx);
+		ctx->pmm_server = false;
+	}
+	/* liteon end */
+
 	atomic_clear_bit(&ctx->state, MODBUS_STATE_CONFIGURED);
 
 	LOG_INF("Modbus interface %u disabled", iface);
 
 	return 0;
 }
+
+/* liteon start */
+struct modbus_pmm_id *_modbus_find_pmm_id(struct modbus_context *ctx, uint8_t id)
+{
+	struct modbus_pmm_id *pmm_id;
+
+	/*
+	 * Find the pmm_id st with the specified unit id
+	 */
+	k_mutex_lock(&ctx->iface_lock, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&ctx->pmm_ids, pmm_id, node)
+	if (pmm_id->id == id) {
+		k_mutex_unlock(&ctx->iface_lock);
+		return pmm_id;
+	}
+	k_mutex_unlock(&ctx->iface_lock);
+
+	return NULL;
+}
+
+void _modbus_unregister_all_pmm_id(struct modbus_context *ctx)
+{
+	struct modbus_pmm_id *pmm_id, *next;
+
+	k_mutex_lock(&ctx->iface_lock, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER_SAFE(&ctx->pmm_ids, pmm_id, next, node) {
+		sys_slist_remove(&ctx->pmm_ids, NULL, &pmm_id->node);
+		k_free(pmm_id);
+	}
+	k_mutex_unlock(&ctx->iface_lock);
+}
+
+int modbus_notify_pmm_trans_finished(const int iface, int result)
+{
+	struct modbus_context *ctx;
+
+	ctx = modbus_get_context(iface);
+	if (ctx == NULL) {
+		LOG_ERR("Interface %u not initialized", iface);
+		return -EINVAL;
+	}
+
+	if (ctx->trans_status == MODBUS_TRANS_WAIT_NOTIFY) {
+		k_timer_stop(&ctx->trans_timeout_timer);
+		ctx->trans_status = MODBUS_TRANS_DONE;
+		ctx->trans_result = result;
+		LOG_DBG("Receive notification of transparent finished and submit work");
+		k_work_submit(&ctx->server_work);
+	}
+	return 0;
+}
+
+struct modbus_pmm_id *modbus_find_pmm_id(const int iface, uint8_t id)
+{
+	struct modbus_context *ctx;
+
+	ctx = modbus_get_context(iface);
+	if (ctx == NULL) {
+		LOG_ERR("Interface %u not initialized", iface);
+		return NULL;
+	}
+
+	if (!ctx->pmm_server) {
+		LOG_ERR("Interface %u not pmm server", iface);
+		return NULL;
+	}
+
+	return _modbus_find_pmm_id(ctx, id);
+}
+
+int modbus_register_pmm_id(const int iface, uint8_t id, uint8_t trans_id)
+{
+	struct modbus_context *ctx;
+	struct modbus_pmm_id *pmm_id;
+
+	ctx = modbus_get_context(iface);
+	if (ctx == NULL) {
+		LOG_ERR("Interface %u not initialized", iface);
+		return -EINVAL;
+	}
+
+	if (!ctx->pmm_server) {
+		LOG_ERR("Interface %u not pmm server", iface);
+		return -EINVAL;
+	}
+
+	if (_modbus_find_pmm_id(ctx, id)) {
+		LOG_DBG("Id already exists");
+		return -EINVAL;
+	}
+
+	pmm_id = k_malloc(sizeof(struct modbus_pmm_id));
+	if (pmm_id == NULL)
+		return -ENOMEM;
+
+	pmm_id->id = id;
+	pmm_id->trans = trans_id != TRANSPARENT_NOT_SUPPORT ? true : false;
+	pmm_id->trans_id = trans_id;
+
+	k_mutex_lock(&ctx->iface_lock, K_FOREVER);
+	sys_slist_append(&ctx->pmm_ids, &pmm_id->node);
+	k_mutex_unlock(&ctx->iface_lock);
+
+	return 0;
+}
+
+int modbus_unregister_pmm_id(const int iface, uint8_t id)
+{
+	struct modbus_context *ctx;
+	struct modbus_pmm_id *pmm_id;
+	bool found = false;
+
+	ctx = modbus_get_context(iface);
+	if (ctx == NULL) {
+		LOG_ERR("Interface %u not initialized", iface);
+		return -EINVAL;
+	}
+
+	if (!ctx->pmm_server) {
+		LOG_ERR("Interface %u not pmm server", iface);
+		return -EINVAL;
+	}
+
+	k_mutex_lock(&ctx->iface_lock, K_FOREVER);
+	SYS_SLIST_FOR_EACH_CONTAINER(&ctx->pmm_ids, pmm_id, node) {
+		if (pmm_id->id == id) {
+			sys_slist_remove(&ctx->pmm_ids, NULL, &pmm_id->node);
+			found = true;
+			break;
+		}
+	}
+	k_mutex_unlock(&ctx->iface_lock);
+
+	if (!found)
+		return -EINVAL;
+
+	k_free(pmm_id);
+
+	return 0;
+}
+
+int modbus_unregister_all_pmm_id(const int iface)
+{
+	struct modbus_context *ctx;
+
+	ctx = modbus_get_context(iface);
+	if (ctx == NULL) {
+		LOG_ERR("Interface %u not initialized", iface);
+		return -EINVAL;
+	}
+
+	if (!ctx->pmm_server) {
+		LOG_ERR("Interface %u not pmm server", iface);
+		return -EINVAL;
+	}
+
+	_modbus_unregister_all_pmm_id(ctx);
+
+	return 0;
+}
+/* liteon end */

@@ -66,6 +66,10 @@ extern "C" {
 #define MODBUS_EXC_GW_TARGET_FAILED_TO_RESP	11
 /** @} */
 
+/* liteon start */
+#define TRANSPARENT_NOT_SUPPORT		0
+/* liteon end */
+
 /**
  * @brief Frame struct used internally and for raw ADU support.
  */
@@ -385,6 +389,48 @@ struct modbus_user_callbacks {
 	int (*holding_reg_wr_fp)(uint16_t addr, float reg);
 };
 
+/** Modbus Server User Callback structure */
+struct modbus_pmm_user_callbacks {
+	/** Coil read callback */
+	int (*coil_rd)(uint8_t id, uint16_t addr, bool *state);
+
+	/** Coil write callback */
+	int (*coil_wr)(uint8_t id, uint16_t addr, bool state);
+
+	/** Discrete Input read callback */
+	int (*discrete_input_rd)(uint8_t id, uint16_t addr, bool *state);
+
+	/** Input Register read callback */
+	int (*input_reg_rd)(uint8_t id, uint16_t addr, uint16_t *reg);
+
+	/** Floating Point Input Register read callback */
+	int (*input_reg_rd_fp)(uint8_t id, uint16_t addr, float *reg);
+
+	/** Holding Register read callback */
+	int (*holding_reg_rd)(uint8_t id, uint16_t addr, uint16_t *reg);
+
+	/** Holding Register write callback */
+	int (*holding_reg_wr)(uint8_t id, uint16_t addr, uint16_t reg);
+
+	/** Floating Point Holding Register read callback */
+	int (*holding_reg_rd_fp)(uint8_t id, uint16_t addr, float *reg);
+
+	/** Floating Point Holding Register write callback */
+	int (*holding_reg_wr_fp)(uint8_t id, uint16_t addr, float reg);
+
+	int (*rtu_rd_start)(uint8_t id, uint8_t trans_id, uint8_t fc, uint16_t start_addr, uint16_t num_regs);
+
+	int (*rtu_rd_trans_task)(uint8_t id, uint8_t trans_id, uint8_t fc, uint16_t start_addr, uint16_t num_regs);
+
+	void (*rtu_rd_end)(uint8_t id, uint8_t trans_id, uint8_t fc, uint16_t start_addr, uint16_t num_regs);
+
+	int (*rtu_wr_start)(uint8_t id, uint8_t trans_id, uint8_t fc, uint16_t start_addr, uint16_t num_regs);
+
+	int (*rtu_wr_trans_task)(uint8_t id, uint8_t trans_id, uint8_t fc, uint16_t start_addr, uint16_t num_regs);
+
+	void (*rtu_wr_end)(uint8_t id, uint8_t fc, uint16_t start_addr, uint16_t num_regs, bool trans);
+};
+
 /**
  * @brief Get Modbus interface index according to interface name
  *
@@ -503,6 +549,12 @@ struct modbus_server_param {
 	uint8_t unit_id;
 };
 
+struct modbus_server_param_pmm {
+	/** Pointer to the User Callback structure */
+	struct modbus_pmm_user_callbacks *pmm_user_cb;
+	uint32_t trans_timeout; // us
+};
+
 struct modbus_raw_cb {
 	modbus_raw_cb_t raw_tx_cb;
 	void *user_data;
@@ -517,6 +569,7 @@ struct modbus_iface_param {
 	enum modbus_mode mode;
 	union {
 		struct modbus_server_param server;
+		struct modbus_server_param_pmm pmm_server;
 		/** Amount of time client will wait for
 		 *  a response from the server.
 		 */
@@ -539,6 +592,8 @@ struct modbus_iface_param {
  * @retval           0 If the function was successful
  */
 int modbus_init_server(const int iface, struct modbus_iface_param param);
+
+int modbus_init_server_pmm(const int iface, struct modbus_iface_param param);
 
 /**
  * @brief Configure Modbus Interface as raw ADU client
@@ -628,6 +683,18 @@ int modbus_raw_backend_txn(const int iface, struct modbus_adu *adu);
  * @retval           0 on success
  */
 int modbus_register_user_fc(const int iface, struct modbus_custom_fc *custom_fc);
+
+/* liteon start */
+int modbus_notify_pmm_trans_finished(const int iface, int result);
+
+struct modbus_pmm_id *modbus_find_pmm_id(const int iface, uint8_t id);
+
+int modbus_register_pmm_id(const int iface, uint8_t id, uint8_t trans_id);
+
+int modbus_unregister_pmm_id(const int iface, uint8_t id);
+
+int modbus_unregister_all_pmm_id(const int iface);
+/* liteon end */
 
 #ifdef __cplusplus
 }

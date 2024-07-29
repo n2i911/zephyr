@@ -89,6 +89,24 @@ struct modbus_serial_config {
 
 #define MODBUS_STATE_CONFIGURED		0
 
+struct modbus_pmm_id {
+
+	sys_snode_t node;
+
+	uint8_t id;
+
+	uint8_t trans_id;
+
+	bool trans;
+};
+
+enum modbus_trans_status {
+	MODBUS_TRANS_NONE,
+	MODBUS_TRANS_WAIT_NOTIFY,
+	MODBUS_TRANS_DONE,
+	MODBUS_TRANS_TIMEOUT,
+};
+
 struct modbus_context {
 	/* Interface name */
 	const char *iface_name;
@@ -106,6 +124,9 @@ struct modbus_context {
 	uint32_t rxwait_to;
 	/* Pointer to user server callbacks */
 	struct modbus_user_callbacks *mbs_user_cb;
+	/* Pointer to dynamic mode user server callbacks */
+	struct modbus_pmm_user_callbacks *mbs_pmm_user_cb;
+
 	/* Interface state */
 	atomic_t state;
 
@@ -135,6 +156,19 @@ struct modbus_context {
 	/* Unit ID */
 	uint8_t unit_id;
 
+	/* liteon start */
+	int trans_result;
+
+	enum modbus_trans_status trans_status;
+
+	struct k_timer trans_timeout_timer;
+
+	k_timeout_t trans_timeout;
+
+	sys_slist_t pmm_ids;
+
+	bool pmm_server;
+	/* liteon end */
 };
 
 /**
@@ -251,5 +285,13 @@ int modbus_raw_rx_adu(struct modbus_context *ctx);
 int modbus_raw_tx_adu(struct modbus_context *ctx);
 int modbus_raw_init(struct modbus_context *ctx,
 		    struct modbus_iface_param param);
+
+/* liteon start */
+bool modbus_server_handler_pmm(struct modbus_context *ctx);
+
+struct modbus_pmm_id *_modbus_find_pmm_id(struct modbus_context *ctx, uint8_t id);
+
+void _modbus_unregister_all_pmm_id(struct modbus_context *ctx);
+/* liteon end */
 
 #endif /* ZEPHYR_INCLUDE_MODBUS_INTERNAL_H_ */

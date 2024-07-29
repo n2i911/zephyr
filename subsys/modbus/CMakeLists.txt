@@ -23,6 +23,7 @@ if(CONFIG_MODBUS)
 	zephyr_library_sources_ifdef(
 		CONFIG_MODBUS_SERVER
 		modbus_server.c
+		modbus_server_pmm.c
 	)
 
 	zephyr_library_sources_ifdef(
